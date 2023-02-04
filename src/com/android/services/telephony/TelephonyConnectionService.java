@@ -64,6 +64,7 @@ import com.android.internal.telephony.d2d.Communicator;
 import com.android.internal.telephony.data.PhoneSwitcher;
 import com.android.internal.telephony.imsphone.ImsExternalCallTracker;
 import com.android.internal.telephony.imsphone.ImsPhone;
+import com.android.internal.telephony.imsphone.ImsPhoneCallTracker;
 import com.android.internal.telephony.imsphone.ImsPhoneConnection;
 import com.android.phone.FrameworksUtils;
 import com.android.phone.MMIDialogActivity;
@@ -553,6 +554,27 @@ public class TelephonyConnectionService extends ConnectionService {
             if (ringingConnection != null) {
                 handleIncomingDsdaCall((TelephonyConnection) ringingConnection);
             }
+
+            /*
+             * As per carrier requirement we need to disable swap when Active call is
+             * VT call and enable swap if that Video call is downgraded to Voice
+             * call.
+             */
+            if (!isConcurrentCallAllowedDuringVideoCall(conn.getPhone())) {
+                return;
+            }
+            /*
+             * Either there is no call present on the other SUB or there is
+             * a connected Video call on other SUB then no need to check
+             * further since here we only handle Voice/Video + Voice use-cases.
+             */
+            PhoneAccountHandle accountHandle = c.getPhoneAccountHandle();
+            if (!isCallPresentOnOtherSub(accountHandle) ||
+                    hasConnectedVideoCallOnOtherSub(accountHandle)) {
+                return;
+            }
+            // Update EXTRA_DISABLE_SWAP_CALL when call state becomes to active
+            disableSwap(conn, VideoProfile.isVideo(conn.getVideoState()));
         }
 
         @Override
@@ -578,6 +600,10 @@ public class TelephonyConnectionService extends ConnectionService {
              if (!isConcurrentCallAllowedDuringVideoCall(conn.getPhone())) {
                  return;
              }
+
+            // Update EXTRA_ANSWERING_DROPS_FG_CALL in DSDA mode
+            updateAnsweringDropsFgCallExtra();
+
             /*
              * Either there is no call present on the other SUB or there is
              * a connected Video call on other SUB then no need to check
@@ -653,7 +679,7 @@ public class TelephonyConnectionService extends ConnectionService {
         updatePhoneAccount(conferenceHostConnection, phone);
         com.android.internal.telephony.Connection originalConnection = null;
         try {
-            if (isAcrossSubHoldInProgress()) {
+            if (isHoldOrSwapInProgress()) {
                 throw new CallStateException("Cannot dial as holding in progress");
             }
             // Get connection to hold if any
@@ -724,7 +750,7 @@ public class TelephonyConnectionService extends ConnectionService {
 
     @Override
     protected void unhold(String callId) {
-        if (isAcrossSubHoldInProgress()) {
+        if (isHoldOrSwapInProgress()) {
             Log.e(this, null, "Cannot unhold call as holding in progress");
             return;
         }
@@ -738,7 +764,7 @@ public class TelephonyConnectionService extends ConnectionService {
 
     @Override
     protected void hold(String callId) {
-        if (isAcrossSubHoldInProgress()) {
+        if (isHoldOrSwapInProgress()) {
             Log.e(this, null, "Cannot unhold call as holding in progress");
             return;
         }
@@ -769,7 +795,7 @@ public class TelephonyConnectionService extends ConnectionService {
 
     @Override
     protected void answerVideo(String callId, int videoState) {
-        if (isAcrossSubHoldInProgress()) {
+        if (isHoldOrSwapInProgress()) {
             Log.e(this, null, "Cannot answer as holding in progress");
             return;
         }
@@ -1617,6 +1643,54 @@ public class TelephonyConnectionService extends ConnectionService {
         }
     }
 
+    private void updateAnsweringDropsFgCallExtra() {
+        // Check for DSDA mode
+        if (!isConcurrentCallsPossible()) {
+            return;
+        }
+
+        TelephonyConnection ringingConnection = (TelephonyConnection) getRingingConnection();
+        if (ringingConnection == null) {
+            return;
+        }
+
+        Phone ringingPhone = ringingConnection.getPhone();
+        if (ringingPhone == null) {
+            return;
+        }
+
+        PhoneAccountHandle ringingHandle = mPhoneUtilsProxy
+                .makePstnPhoneAccountHandle(ringingPhone);
+        com.android.internal.telephony.Connection ringingOriginalConnection = ringingConnection
+                .getOriginalConnection();
+        // If holding Video call is allowed or ringing connection is null or is not IMS then return
+        if (isVideoCallHoldAllowedOnOtherSub(ringingPhone)
+                || ringingOriginalConnection == null
+                || ringingOriginalConnection.getPhoneType() != PhoneConstants.PHONE_TYPE_IMS) {
+            return;
+        }
+
+        /*
+         * In DSDA mode, if holding Video call is not allowed on the other SUB then active
+         * video call is downgraded or active voice call is upgraded:
+         * 1) If a video call is downgraded to voice call then answering the incoming
+         *    call will not end the call(s) on the other SUB.
+         * 2) If a voice call is upgraded to video call then answering the incoming
+         *    call will end the call(s) on the other SUB.
+         */
+        ImsPhoneConnection imsOriginalConnection = (ImsPhoneConnection) ringingOriginalConnection;
+        boolean hasConnectedVideoCallOnOtherSub = hasConnectedVideoCallOnOtherSub(ringingHandle);
+        if (!hasConnectedVideoCallOnOtherSub &&
+                ringingOriginalConnection.isActiveCallDisconnectedOnAnswer()) {
+            Log.v(this, "updateAnsweringDropsFgCallExtra remove extra in ringing connection");
+            ringingConnection.removeExtras(Connection.EXTRA_ANSWERING_DROPS_FG_CALL);
+        } else if (hasConnectedVideoCallOnOtherSub &&
+                !ringingOriginalConnection.isActiveCallDisconnectedOnAnswer()) {
+            Log.v(this, "updateAnsweringDropsFgCallExtra enable extra in ringing connection");
+            enableAnsweringWillDisconnect(imsOriginalConnection, ringingConnection);
+        }
+    }
+
     public boolean isVideoCrsForVoLteCall(TelephonyConnection connection) {
         return getOriginalCallType(connection) == VideoProfile.STATE_AUDIO_ONLY &&
                 isVideoCrsCall(connection);
@@ -2228,7 +2302,7 @@ public class TelephonyConnectionService extends ConnectionService {
 
         final com.android.internal.telephony.Connection originalConnection;
         try {
-            if (isAcrossSubHoldInProgress()) {
+            if (isHoldOrSwapInProgress()) {
                 throw new CallStateException("Cannot dial as holding in progress");
             }
             if (phone != null) {
@@ -3425,6 +3499,34 @@ public class TelephonyConnectionService extends ConnectionService {
             }
         }
         return null;
+    }
+
+    // When one of the subs call is resumed/swaped, the mHoldHandler is
+    // not initialized as it is not a cross sub swap use case. then
+    // need to check ImsPhoneCallTracker's hold/swap status to prevent
+    // placing outgong calls/conf, or answering video, or holding, or
+    // resuming when there is hold / unhold request on one sub or cross
+    // sub hold in progress.
+    // Return the ture if hold/resume/swap is in progress, else false.
+    private boolean isHoldOrSwapInProgress() {
+        for (Phone ph : mPhoneFactoryProxy.getPhones()) {
+            if (!(ph.getImsPhone() instanceof ImsPhone)) {
+                continue;
+            }
+            ImsPhone imsPhone = (ImsPhone) ph.getImsPhone();
+
+            if (!(imsPhone.getCallTracker() instanceof ImsPhoneCallTracker)) {
+                continue;
+            }
+            ImsPhoneCallTracker imsPhoneCallTracker =
+                (ImsPhoneCallTracker) imsPhone.getCallTracker();
+
+            if(imsPhoneCallTracker.isHoldOrSwapInProgress()) {
+                Log.d(this, "Hold Or Swap In Progress.");
+                return true;
+            }
+        }
+        return isAcrossSubHoldInProgress();
     }
 
     private boolean isAcrossSubHoldInProgress() {
